@@ -1,0 +1,10 @@
+[package]
+name = "three_three_dee_dee"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30"
+wgpu = "23.0"
+pollster = "0.3"
+env_logger = "0.11"
