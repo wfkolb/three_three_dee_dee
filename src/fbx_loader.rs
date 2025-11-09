@@ -1,19 +1,6 @@
 use std::fs::File;
 use std::io::BufReader;
-
-/// Represents a 3D vertex with position coordinates
-#[derive(Debug, Clone, Copy)]
-pub struct Vertex {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-impl Vertex {
-    pub fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-}
+use crate::reference_mesh::Vertex;
 
 /// Represents a mesh loaded from an FBX file
 #[derive(Debug)]
@@ -159,12 +146,30 @@ impl FbxLoader {
         match &node.properties[0] {
             fbx::Property::I32Array(indices) => {
                 let mut result = Vec::new();
+                let mut polygon = Vec::new();
+
                 for &idx in indices {
                     // FBX uses negative indices to mark polygon boundaries
-                    // Convert negative indices to positive
-                    let index = if idx < 0 { -idx - 1 } else { idx };
-                    result.push(index as u32);
+                    // Negative value means this is the last vertex of the polygon
+                    let is_last = idx < 0;
+                    let index = if is_last { -idx - 1 } else { idx } as u32;
+                    polygon.push(index);
+
+                    if is_last {
+                        // Triangulate the polygon using a fan triangulation
+                        // For a polygon with vertices [0, 1, 2, 3, ...], create triangles:
+                        // [0, 1, 2], [0, 2, 3], [0, 3, 4], etc.
+                        if polygon.len() >= 3 {
+                            for i in 1..(polygon.len() - 1) {
+                                result.push(polygon[0]);
+                                result.push(polygon[i]);
+                                result.push(polygon[i + 1]);
+                            }
+                        }
+                        polygon.clear();
+                    }
                 }
+
                 Some(result)
             }
             _ => None,

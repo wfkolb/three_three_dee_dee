@@ -7,12 +7,20 @@ use winit::{
 };
 
 mod fbx_loader;
+mod reference_mesh;
 mod renderer;
 mod screen;
 
 use fbx_loader::FbxLoader;
+use reference_mesh::ReferenceMesh;
 use renderer::{Camera, Viewport};
-use screen::Screen;
+use screen::{MeshSource, Screen};
+
+/// Enum to hold either FBX or reference mesh data
+enum MeshData {
+    Fbx(FbxLoader),
+    Reference(ReferenceMesh),
+}
 
 struct State {
     surface: wgpu::Surface<'static>,
@@ -25,11 +33,18 @@ struct State {
 }
 
 impl State {
-    async fn new(window: std::sync::Arc<Window>, fbx_loader: FbxLoader) -> Self {
+    async fn new(window: std::sync::Arc<Window>, mesh_data: MeshData) -> Self {
         // Get model info for camera positioning
-        let model_center = fbx_loader.get_center();
-        let model_size = fbx_loader.get_max_dimension();
-        println!("\nModel info for camera setup:");
+        let (model_center, model_size) = match &mesh_data {
+            MeshData::Reference(ref_mesh) => {
+                println!("\nUsing reference mesh for camera setup:");
+                (ref_mesh.get_center(), ref_mesh.get_max_dimension())
+            }
+            MeshData::Fbx(fbx) => {
+                println!("\nUsing FBX model for camera setup:");
+                (fbx.get_center(), fbx.get_max_dimension())
+            }
+        };
         println!("  Center: ({}, {}, {})", model_center[0], model_center[1], model_center[2]);
         println!("  Max dimension: {}", model_size);
         let size = window.inner_size();
@@ -92,82 +107,51 @@ impl State {
         // Create and configure screen with renderers
         let mut screen = Screen::new();
 
-        // Position cameras based on model size
-        // Camera distance = model_size * 2.5 to see the whole model
-        let camera_distance = model_size *0.5;
+        // Position camera to orbit around the cube
+        // Camera distance = model_size * 2.5 to see the whole model comfortably
+        let camera_distance = model_size * 2.5;
 
-        // Top half renderer - looking at model center from the front
-        let cam1_pos = [
+        // Start camera at a position on the Z axis, looking at the center
+        let cam_pos = [
             model_center[0],
             model_center[1],
             model_center[2] + camera_distance,
         ];
-        let cam1_dir = [
-            model_center[0] - cam1_pos[0],
-            model_center[1] - cam1_pos[1],
-            model_center[2] - cam1_pos[2],
+        let cam_dir = [
+            model_center[0] - cam_pos[0],
+            model_center[1] - cam_pos[1],
+            model_center[2] - cam_pos[2],
         ];
-        //let cam1_dir = [
-         //   1.0,0.0,0.0
-        //];
 
-        println!("  Camera 1: pos=({}, {}, {}), dir=({}, {}, {})",
-            cam1_pos[0], cam1_pos[1], cam1_pos[2],
-            cam1_dir[0], cam1_dir[1], cam1_dir[2]);
+        println!("  Camera: pos=({}, {}, {}), dir=({}, {}, {})",
+            cam_pos[0], cam_pos[1], cam_pos[2],
+            cam_dir[0], cam_dir[1], cam_dir[2]);
+        println!("  Camera distance: {}", camera_distance);
 
         screen.add_renderer(
             Camera::new(
-                cam1_pos,
-                cam1_dir,  // looking toward model center
+                cam_pos,
+                cam_dir,
                 0.1,       // near plane
-                camera_distance * 10.0,  // far plane
+                100.0,     // far plane
             ),
             Viewport {
                 x: 0,
                 y: 0,
                 width: size.width,
-                height: size.height ,
+                height: size.height,
             },
             0, // no frame offset
             model_center,
             camera_distance,
         );
 
-        // Bottom half renderer - looking at model from the side
-        let cam2_pos = [
-            model_center[0] - camera_distance,
-            model_center[1],
-            model_center[2],
-        ];
-        let cam2_dir = [
-            model_center[0] - cam2_pos[0],
-            model_center[1] - cam2_pos[1],
-            model_center[2] - cam2_pos[2],
-        ];
-        println!("  Camera 2: pos=({}, {}, {}), dir=({}, {}, {})",
-            cam2_pos[0], cam2_pos[1], cam2_pos[2],
-            cam2_dir[0], cam2_dir[1], cam2_dir[2]);
-        /*
-        screen.add_renderer(
-            Camera::new(
-                cam2_pos,
-                cam2_dir,  // looking toward model center
-                0.01,       // near plane
-                camera_distance * 10.0,  // far plane
-            ),
-            Viewport {
-                x: 0,
-                y: size.height / 2,
-                width: size.width,
-                height: size.height / 2,
-            },
-            0, // no frame offset for second camera too (removed the 10 frame offset)
-            model_center,
-            camera_distance,
-        );*/
-
-        // Initialize renderers with FBX data
-        screen.initialize_renderers(&device, &config, &fbx_loader);
+        // Initialize renderers with mesh data
+        let mesh_source = match &mesh_data {
+            MeshData::Reference(ref_mesh) => MeshSource::Reference(ref_mesh),
+            MeshData::Fbx(fbx) => MeshSource::Fbx(fbx),
+        };
+        screen.initialize_renderers(&device, &config, mesh_source);
 
         Self {
             surface,
@@ -236,14 +220,14 @@ impl State {
 
 struct App {
     state: Option<State>,
-    fbx_loader: Option<FbxLoader>,
+    mesh_data: Option<MeshData>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
             let window_attributes = Window::default_attributes()
-                .with_title("3D Renderer - Hello wgpu!")
+                .with_title("3D Renderer")
                 .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
 
             let window = std::sync::Arc::new(
@@ -252,8 +236,8 @@ impl ApplicationHandler for App {
                     .unwrap()
             );
 
-            let fbx_loader = self.fbx_loader.take().expect("FBX loader not initialized");
-            self.state = Some(pollster::block_on(State::new(window, fbx_loader)));
+            let mesh_data = self.mesh_data.take().expect("Mesh data not initialized");
+            self.state = Some(pollster::block_on(State::new(window, mesh_data)));
         }
     }
 
@@ -301,12 +285,10 @@ impl ApplicationHandler for App {
         }
     }
 }
-
-
 fn load_fbx_file(path: &str) -> Result<FbxLoader, Box<dyn std::error::Error>> {
     let fbx_loader = FbxLoader::load(path)?;
 
-    println!("\nLoaded FBX Summary:");
+    println!("\nLoaded FBX file: {}", path);
     println!("  Total meshes: {}", fbx_loader.meshes.len());
     println!("  Total vertices: {}", fbx_loader.total_vertex_count());
     println!("  Total indices: {}", fbx_loader.total_index_count());
@@ -324,36 +306,49 @@ fn load_fbx_file(path: &str) -> Result<FbxLoader, Box<dyn std::error::Error>> {
     Ok(fbx_loader)
 }
 
-
 fn main() {
     env_logger::init();
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    // Use default FBX file if none provided
-    let fbx_path = if args.len() >= 2 {
-        args[1].clone()
+    // Determine which mesh to use
+    let mesh_data = if args.len() >= 2 {
+        // FBX file path provided
+        let fbx_path = &args[1];
+        match load_fbx_file(fbx_path) {
+            Ok(fbx_loader) => MeshData::Fbx(fbx_loader),
+            Err(e) => {
+                eprintln!("Error loading FBX file '{}': {}", fbx_path, e);
+                eprintln!("Falling back to reference cube mesh");
+                let reference_mesh = ReferenceMesh::cube();
+                println!("\nCreated reference cube mesh:");
+                println!("  Vertices: {}", reference_mesh.vertices.len());
+                println!("  Indices: {}", reference_mesh.indices.len());
+                MeshData::Reference(reference_mesh)
+            }
+        }
     } else {
-        "resources/headphones_joined.fbx".to_string()
-    };
-
-    // Load the FBX file
-    let fbx_loader = match load_fbx_file(&fbx_path) {
-        Ok(loader) => {
-            println!("Successfully loaded FBX file: {}", fbx_path);
-            loader
-        }
-        Err(e) => {
-            eprintln!("Error loading FBX file '{}': {}", fbx_path, e);
-            std::process::exit(1);
-        }
+        // No FBX file provided, use reference mesh
+        let reference_mesh = ReferenceMesh::cube();
+        println!("\nNo FBX file provided, using reference cube mesh:");
+        println!("  Vertices: {}", reference_mesh.vertices.len());
+        println!("  Indices: {}", reference_mesh.indices.len());
+        println!("  Center: ({}, {}, {})",
+            reference_mesh.get_center()[0],
+            reference_mesh.get_center()[1],
+            reference_mesh.get_center()[2]
+        );
+        println!("  Max dimension: {}", reference_mesh.get_max_dimension());
+        println!("\nTip: Run with an FBX file path as an argument to load a model");
+        println!("  Example: cargo run resources/model.fbx");
+        MeshData::Reference(reference_mesh)
     };
 
     let event_loop = EventLoop::new().unwrap();
     let mut app = App {
         state: None,
-        fbx_loader: Some(fbx_loader),
+        mesh_data: Some(mesh_data),
     };
 
     event_loop.run_app(&mut app).unwrap();

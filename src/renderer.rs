@@ -1,4 +1,4 @@
-use crate::fbx_loader::Vertex;
+use crate::reference_mesh::Vertex;
 use wgpu::util::DeviceExt;
 
 /// Viewport definition for screen segmentation
@@ -78,7 +78,7 @@ impl Renderer {
             frame_offset,
             model_center,
             camera_distance,
-            rotation_speed: 0.1, // radians per frame
+            rotation_speed: 0.01, // radians per frame (slower, smoother rotation)
             current_angle: 0.0,
             vertex_buffer: None,
             index_buffer: None,
@@ -94,19 +94,15 @@ impl Renderer {
         self.current_angle += self.rotation_speed;
 
         // Orbit camera around model center
-       let x = self.model_center[0] + self.camera_distance * self.current_angle.cos();
+        let x = self.model_center[0] + self.camera_distance * self.current_angle.cos();
         let z = self.model_center[2] + self.camera_distance * self.current_angle.sin();
 
         self.camera.position = [x, self.model_center[1], z];
         self.camera.direction = [
             self.model_center[0] - x,
-           self.model_center[1] - self.camera.position[1],
+            self.model_center[1] - self.camera.position[1],
             self.model_center[2] - z,
         ];
-        //println!("Current angle- {}", self.current_angle);
-      //  self.camera.direction = [
-       //     0.0,0.0,1.0
-       // ];
 
         // Update uniforms with new camera position
         let uniforms = self.create_uniforms();
@@ -229,7 +225,7 @@ impl Renderer {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    cull_mode: None,  // Disable culling to see both sides
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -264,12 +260,32 @@ impl Renderer {
         let fov_y = 45.0_f32.to_radians();
         let projection = Self::perspective(fov_y, aspect, self.camera.near_plane, self.camera.far_plane);
 
+        let mut view_proj = Self::multiply_matrices(projection, view);
+
+        // Store the rotation angle in an unused part of the matrix
+        // Use first row, last column to pass the angle to the shader
+        view_proj[0][3] = self.current_angle;
+
+        // Debug output on first frame
+        static FIRST_CALL: std::sync::Once = std::sync::Once::new();
+        FIRST_CALL.call_once(|| {
+            println!("\n=== Camera Debug Info ===");
+            println!("Eye: [{}, {}, {}]", eye[0], eye[1], eye[2]);
+            println!("Target: [{}, {}, {}]", target[0], target[1], target[2]);
+            println!("FOV: {} degrees, Aspect: {}", fov_y.to_degrees(), aspect);
+            println!("Near: {}, Far: {}", self.camera.near_plane, self.camera.far_plane);
+            println!("View-Projection matrix:");
+            for row in &view_proj {
+                println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+            }
+        });
+
         Uniforms {
-            view_proj: Self::multiply_matrices(projection, view),
+            view_proj,
         }
     }
 
-    /// Simple look-at matrix
+    /// Simple look-at matrix (column-major for WGSL)
     fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
         let f = Self::normalize([
             target[0] - eye[0],
@@ -279,29 +295,37 @@ impl Renderer {
         let s = Self::normalize(Self::cross(f, up));
         let u = Self::cross(s, f);
 
+        // Column-major matrix for WGSL
         [
-            [s[0], u[0], -f[0], 0.0],
-            [s[1], u[1], -f[1], 0.0],
-            [s[2], u[2], -f[2], 0.0],
+            [s[0], s[1], s[2], 0.0],
+            [u[0], u[1], u[2], 0.0],
+            [-f[0], -f[1], -f[2], 0.0],
             [-Self::dot(s, eye), -Self::dot(u, eye), Self::dot(f, eye), 1.0],
         ]
     }
 
-    /// Perspective projection matrix
+    /// Perspective projection matrix for WebGPU/Metal (0 to 1 depth range, column-major)
     fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
         let f = 1.0 / (fov_y / 2.0).tan();
+        // WebGPU uses 0 to 1 depth range (not -1 to 1 like OpenGL)
+        // Column-major matrix for WGSL
         [
             [f / aspect, 0.0, 0.0, 0.0],
             [0.0, f, 0.0, 0.0],
-            [0.0, 0.0, (far + near) / (near - far), -1.0],
-            [0.0, 0.0, (2.0 * far * near) / (near - far), 0.0],
+            [0.0, 0.0, far / (near - far), (near * far) / (near - far)],
+            [0.0, 0.0, -1.0, 0.0],
         ]
     }
 
     // Helper math functions
     fn normalize(v: [f32; 3]) -> [f32; 3] {
         let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        [v[0] / len, v[1] / len, v[2] / len]
+        if len > 0.0 {
+            [v[0] / len, v[1] / len, v[2] / len]
+        } else {
+            // Return a default up vector for zero-length vectors
+            [0.0, 1.0, 0.0]
+        }
     }
 
     fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
