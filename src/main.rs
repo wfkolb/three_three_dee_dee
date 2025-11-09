@@ -6,6 +6,14 @@ use winit::{
     window::{Window, WindowId},
 };
 
+mod fbx_loader;
+mod renderer;
+mod screen;
+
+use fbx_loader::FbxLoader;
+use renderer::{Camera, Viewport};
+use screen::Screen;
+
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -13,10 +21,17 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: std::sync::Arc<winit::window::Window>,
+    screen: Screen,
 }
 
 impl State {
-    async fn new(window: std::sync::Arc<Window>) -> Self {
+    async fn new(window: std::sync::Arc<Window>, fbx_loader: FbxLoader) -> Self {
+        // Get model info for camera positioning
+        let model_center = fbx_loader.get_center();
+        let model_size = fbx_loader.get_max_dimension();
+        println!("\nModel info for camera setup:");
+        println!("  Center: ({}, {}, {})", model_center[0], model_center[1], model_center[2]);
+        println!("  Max dimension: {}", model_size);
         let size = window.inner_size();
 
         // Create wgpu instance
@@ -74,6 +89,86 @@ impl State {
 
         surface.configure(&device, &config);
 
+        // Create and configure screen with renderers
+        let mut screen = Screen::new();
+
+        // Position cameras based on model size
+        // Camera distance = model_size * 2.5 to see the whole model
+        let camera_distance = model_size *0.5;
+
+        // Top half renderer - looking at model center from the front
+        let cam1_pos = [
+            model_center[0],
+            model_center[1],
+            model_center[2] + camera_distance,
+        ];
+        let cam1_dir = [
+            model_center[0] - cam1_pos[0],
+            model_center[1] - cam1_pos[1],
+            model_center[2] - cam1_pos[2],
+        ];
+        //let cam1_dir = [
+         //   1.0,0.0,0.0
+        //];
+
+        println!("  Camera 1: pos=({}, {}, {}), dir=({}, {}, {})",
+            cam1_pos[0], cam1_pos[1], cam1_pos[2],
+            cam1_dir[0], cam1_dir[1], cam1_dir[2]);
+
+        screen.add_renderer(
+            Camera::new(
+                cam1_pos,
+                cam1_dir,  // looking toward model center
+                0.1,       // near plane
+                camera_distance * 10.0,  // far plane
+            ),
+            Viewport {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height ,
+            },
+            0, // no frame offset
+            model_center,
+            camera_distance,
+        );
+
+        // Bottom half renderer - looking at model from the side
+        let cam2_pos = [
+            model_center[0] - camera_distance,
+            model_center[1],
+            model_center[2],
+        ];
+        let cam2_dir = [
+            model_center[0] - cam2_pos[0],
+            model_center[1] - cam2_pos[1],
+            model_center[2] - cam2_pos[2],
+        ];
+        println!("  Camera 2: pos=({}, {}, {}), dir=({}, {}, {})",
+            cam2_pos[0], cam2_pos[1], cam2_pos[2],
+            cam2_dir[0], cam2_dir[1], cam2_dir[2]);
+        /*
+        screen.add_renderer(
+            Camera::new(
+                cam2_pos,
+                cam2_dir,  // looking toward model center
+                0.01,       // near plane
+                camera_distance * 10.0,  // far plane
+            ),
+            Viewport {
+                x: 0,
+                y: size.height / 2,
+                width: size.width,
+                height: size.height / 2,
+            },
+            0, // no frame offset for second camera too (removed the 10 frame offset)
+            model_center,
+            camera_distance,
+        );*/
+
+        // Initialize renderers with FBX data
+        screen.initialize_renderers(&device, &config, &fbx_loader);
+
         Self {
             surface,
             device,
@@ -81,6 +176,7 @@ impl State {
             config,
             size,
             window,
+            screen,
         }
     }
 
@@ -105,9 +201,10 @@ impl State {
                 label: Some("Render Encoder"),
             });
 
+        // First, clear the entire screen
         {
             let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Clear Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -127,6 +224,9 @@ impl State {
             });
         }
 
+        // Render all viewports via Screen
+        self.screen.render(&mut encoder, &view, &self.queue);
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -136,6 +236,7 @@ impl State {
 
 struct App {
     state: Option<State>,
+    fbx_loader: Option<FbxLoader>,
 }
 
 impl ApplicationHandler for App {
@@ -151,7 +252,8 @@ impl ApplicationHandler for App {
                     .unwrap()
             );
 
-            self.state = Some(pollster::block_on(State::new(window)));
+            let fbx_loader = self.fbx_loader.take().expect("FBX loader not initialized");
+            self.state = Some(pollster::block_on(State::new(window, fbx_loader)));
         }
     }
 
@@ -200,11 +302,59 @@ impl ApplicationHandler for App {
     }
 }
 
+
+fn load_fbx_file(path: &str) -> Result<FbxLoader, Box<dyn std::error::Error>> {
+    let fbx_loader = FbxLoader::load(path)?;
+
+    println!("\nLoaded FBX Summary:");
+    println!("  Total meshes: {}", fbx_loader.meshes.len());
+    println!("  Total vertices: {}", fbx_loader.total_vertex_count());
+    println!("  Total indices: {}", fbx_loader.total_index_count());
+
+    for (i, mesh) in fbx_loader.meshes.iter().enumerate() {
+        println!(
+            "  Mesh {}: '{}' - {} vertices, {} indices",
+            i,
+            mesh.name,
+            mesh.vertices.len(),
+            mesh.indices.len()
+        );
+    }
+
+    Ok(fbx_loader)
+}
+
+
 fn main() {
     env_logger::init();
 
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+
+    // Use default FBX file if none provided
+    let fbx_path = if args.len() >= 2 {
+        args[1].clone()
+    } else {
+        "resources/headphones_joined.fbx".to_string()
+    };
+
+    // Load the FBX file
+    let fbx_loader = match load_fbx_file(&fbx_path) {
+        Ok(loader) => {
+            println!("Successfully loaded FBX file: {}", fbx_path);
+            loader
+        }
+        Err(e) => {
+            eprintln!("Error loading FBX file '{}': {}", fbx_path, e);
+            std::process::exit(1);
+        }
+    };
+
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App { state: None };
+    let mut app = App {
+        state: None,
+        fbx_loader: Some(fbx_loader),
+    };
 
     event_loop.run_app(&mut app).unwrap();
 }
