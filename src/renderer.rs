@@ -69,7 +69,7 @@ impl GpuVertex {
 pub struct Renderer {
     pub camera: Camera,
     pub viewport: Viewport,
-    pub frame_offset: u32,
+    pub time_offset: f32, // Time offset in seconds
     model_center: [f32; 3],
     pub camera_distance: f32,
     rotation_speed: f32,
@@ -91,7 +91,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(camera: Camera, viewport: Viewport, frame_offset: u32, model_center: [f32; 3], camera_distance: f32) -> Self {
+    pub fn new(camera: Camera, viewport: Viewport, time_offset: f32, model_center: [f32; 3], camera_distance: f32) -> Self {
         println!("Renderer::new - Initial camera_distance: {}", camera_distance);
         println!("Renderer::new - Initial current_angle: {} rad ({} deg)", std::f32::consts::PI / 2.0, 90.0);
         println!("Renderer::new - Initial pitch: {} rad ({} deg)", camera.pitch, camera.pitch.to_degrees());
@@ -99,7 +99,7 @@ impl Renderer {
         Self {
             camera,
             viewport,
-            frame_offset,
+            time_offset,
             model_center,
             camera_distance,
             rotation_speed: 0.00, // radians per frame (slower, smoother rotation)
@@ -214,6 +214,19 @@ impl Renderer {
         ];
 
         // Update uniforms
+        let uniforms = self.create_uniforms();
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+    }
+
+    /// Update viewport dimensions and recreate resources that depend on it
+    pub fn update_viewport(&mut self, new_viewport: Viewport, queue: &wgpu::Queue) {
+        self.viewport = new_viewport;
+
+        // Update uniforms (projection matrix depends on aspect ratio)
         let uniforms = self.create_uniforms();
         queue.write_buffer(
             self.uniform_buffer.as_ref().unwrap(),
@@ -609,17 +622,13 @@ impl Renderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        frame_number: u32,
+        elapsed_time: f32,
     ) {
-        // Apply frame offset
-        if self.frame_offset > 0 && (frame_number % (self.frame_offset + 1)) != 0 {
-            return; // Skip this frame based on offset
-        }
+        // Apply time offset - this viewport's effective time
+        let _viewport_time = elapsed_time + self.time_offset;
 
-        if frame_number == 0 {
-            println!("Renderer: First render - drawing {} indices at viewport ({}, {}, {}x{})",
-                self.num_indices, self.viewport.x, self.viewport.y, self.viewport.width, self.viewport.height);
-        }
+        // Note: Currently animations are handled by camera updates, not per-frame in render
+        // The time offset is applied during camera updates instead
 
         let render_pass_desc = wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),

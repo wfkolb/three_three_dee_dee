@@ -15,6 +15,7 @@ use fbx_loader::FbxLoader;
 use reference_mesh::ReferenceMesh;
 use renderer::{Camera, Viewport};
 use screen::{MeshSource, Screen};
+use rand::Rng;
 
 /// Enum to hold either FBX or reference mesh data
 enum MeshData {
@@ -33,6 +34,11 @@ struct State {
     text_brush: wgpu_text::TextBrush<wgpu_text::glyph_brush::ab_glyph::FontArc>,
     mouse_pressed: bool,
     last_mouse_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+    mesh_data: MeshData,
+    vertices: Vec<reference_mesh::Vertex>,
+    indices: Vec<u32>,
+    modifiers: winit::keyboard::ModifiersState,
+    start_time: std::time::Instant,
 }
 
 impl State {
@@ -105,8 +111,34 @@ impl State {
 
         surface.configure(&device, &config);
 
+        // Extract vertices and indices for later use
+        let (vertices, indices) = match &mesh_data {
+            MeshData::Reference(ref_mesh) => {
+                (ref_mesh.vertices.clone(), ref_mesh.indices.clone())
+            }
+            MeshData::Fbx(fbx) => {
+                let verts = fbx.get_all_vertices();
+                let mut all_indices = Vec::new();
+                let mut vertex_offset = 0u32;
+                for mesh in &fbx.meshes {
+                    if mesh.indices.is_empty() {
+                        for i in 0..mesh.vertices.len() as u32 {
+                            all_indices.push(vertex_offset + i);
+                        }
+                    } else {
+                        for &idx in &mesh.indices {
+                            all_indices.push(vertex_offset + idx);
+                        }
+                    }
+                    vertex_offset += mesh.vertices.len() as u32;
+                }
+                (verts, all_indices)
+            }
+        };
+
         // Create and configure screen with renderers
         let mut screen = Screen::new();
+        screen.set_model_params(model_center, model_size * 2.5);
 
         // Position camera to orbit around the cube
         // Camera distance = model_size * 2.5 to see the whole model comfortably
@@ -142,7 +174,7 @@ impl State {
                 width: size.width,
                 height: size.height,
             },
-            0, // no frame offset
+            0.0, // no time offset
             model_center,
             camera_distance,
         );
@@ -177,6 +209,11 @@ impl State {
             text_brush,
             mouse_pressed: false,
             last_mouse_pos: None,
+            mesh_data,
+            vertices,
+            indices,
+            modifiers: winit::keyboard::ModifiersState::default(),
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -186,6 +223,12 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+
+            // Recalculate viewport layout for new window size
+            self.screen.recalculate_viewports(new_size.width, new_size.height, &self.queue);
+
+            // Resize text brush
+            self.text_brush.resize_view(new_size.width as f32, new_size.height as f32, &self.queue);
         }
     }
 
@@ -224,8 +267,11 @@ impl State {
             });
         }
 
+        // Calculate elapsed time in seconds
+        let elapsed_time = self.start_time.elapsed().as_secs_f32();
+
         // Render all viewports via Screen
-        self.screen.render(&mut encoder, &view, &self.queue);
+        self.screen.render(&mut encoder, &view, &self.queue, elapsed_time);
 
         // Draw camera orientation text
         if let Some((azimuth, elevation, _roll)) = self.screen.get_camera_orientation() {
@@ -334,12 +380,12 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
-                        state: ElementState::Pressed,
+                        state: key_state,
                         physical_key: PhysicalKey::Code(key_code),
                         ..
                     },
                 ..
-            } => {
+            } if key_state == ElementState::Pressed => {
                 match key_code {
                     KeyCode::ArrowUp => {
                         state.screen.adjust_light(0.1, &state.queue);
@@ -347,8 +393,39 @@ impl ApplicationHandler for App {
                     KeyCode::ArrowDown => {
                         state.screen.adjust_light(-0.1, &state.queue);
                     }
+                    KeyCode::Equal | KeyCode::NumpadAdd => {
+                        // Add viewport (+ key)
+                        // Generate random time offset if Shift is held (0-2 seconds)
+                        let time_offset = if state.modifiers.shift_key() {
+                            rand::thread_rng().gen_range(0.0..=2.0)
+                        } else {
+                            0.0
+                        };
+
+                        state.screen.add_viewport(
+                            &state.device,
+                            &state.config,
+                            &state.vertices,
+                            &state.indices,
+                            state.size.width,
+                            state.size.height,
+                            &state.queue,
+                            time_offset,
+                        );
+                    }
+                    KeyCode::Minus | KeyCode::NumpadSubtract => {
+                        // Remove viewport (- key)
+                        state.screen.remove_viewport(
+                            state.size.width,
+                            state.size.height,
+                            &state.queue,
+                        );
+                    }
                     _ => {}
                 }
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                state.modifiers = new_modifiers.state();
             }
             WindowEvent::Resized(physical_size) => {
                 state.resize(physical_size);
