@@ -92,6 +92,10 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(camera: Camera, viewport: Viewport, frame_offset: u32, model_center: [f32; 3], camera_distance: f32) -> Self {
+        println!("Renderer::new - Initial camera_distance: {}", camera_distance);
+        println!("Renderer::new - Initial current_angle: {} rad ({} deg)", std::f32::consts::PI / 2.0, 90.0);
+        println!("Renderer::new - Initial pitch: {} rad ({} deg)", camera.pitch, camera.pitch.to_degrees());
+
         Self {
             camera,
             viewport,
@@ -99,7 +103,7 @@ impl Renderer {
             model_center,
             camera_distance,
             rotation_speed: 0.00, // radians per frame (slower, smoother rotation)
-            current_angle: 0.0,
+            current_angle: std::f32::consts::PI / 2.0, // Start at 90° to match initial +Z position
             light_strength: 0.7,
             vertex_buffer: None,
             index_buffer: None,
@@ -194,7 +198,7 @@ impl Renderer {
     /// Adjust camera distance (zoom in/out)
     pub fn adjust_camera_distance(&mut self, distance_delta: f32, queue: &wgpu::Queue) {
         // Adjust distance with min/max constraints
-        self.camera_distance = (self.camera_distance + distance_delta).clamp(0.5, 50.0);
+        self.camera_distance = (self.camera_distance + distance_delta).clamp(-5000.0, 5000.0);
 
         // Recalculate camera position with new distance
         let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
@@ -450,24 +454,30 @@ impl Renderer {
         let fov_y = 45.0_f32.to_radians();
         let projection = Self::perspective(fov_y, aspect, self.camera.near_plane, self.camera.far_plane);
 
-        let mut view_proj = Self::multiply_matrices(projection, view);
-
-        // Store rotation angles and distance in unused parts of the matrix
-        // Use first row, last column for azimuth (yaw)
-        // Use second row, last column for elevation (pitch)
-        // Use third row, last column for camera distance
-        view_proj[0][3] = self.current_angle;
-        view_proj[1][3] = self.camera.pitch;
-        view_proj[2][3] = self.camera_distance;
+        // Build view-projection matrix (projection * view for standard transform order)
+        // Matrices are already in WebGPU column-major format
+        let view_proj = Self::multiply_matrices_column_major(projection, view);
 
         // Debug output on first frame
         static FIRST_CALL: std::sync::Once = std::sync::Once::new();
         FIRST_CALL.call_once(|| {
             println!("\n=== Camera Debug Info ===");
+            println!("Model center: [{}, {}, {}]", self.model_center[0], self.model_center[1], self.model_center[2]);
+            println!("Camera distance: {}", self.camera_distance);
+            println!("Current angle (azimuth): {} rad ({} deg)", self.current_angle, self.current_angle.to_degrees());
+            println!("Pitch (elevation): {} rad ({} deg)", self.camera.pitch, self.camera.pitch.to_degrees());
             println!("Eye: [{}, {}, {}]", eye[0], eye[1], eye[2]);
             println!("Target: [{}, {}, {}]", target[0], target[1], target[2]);
             println!("FOV: {} degrees, Aspect: {}", fov_y.to_degrees(), aspect);
             println!("Near: {}, Far: {}", self.camera.near_plane, self.camera.far_plane);
+            println!("View matrix:");
+            for row in &view {
+                println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+            }
+            println!("Projection matrix:");
+            for row in &projection {
+                println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+            }
             println!("View-Projection matrix:");
             for row in &view_proj {
                 println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
@@ -481,35 +491,45 @@ impl Renderer {
         }
     }
 
-    /// Simple look-at matrix (column-major for WGSL)
+    /// Look-at view matrix (WebGPU column-major format)
+    /// Camera at 'eye' looking at 'target' with 'up' direction
     fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
+        // Forward vector (from eye to target)
         let f = Self::normalize([
             target[0] - eye[0],
             target[1] - eye[1],
             target[2] - eye[2],
         ]);
+        // Right vector
         let s = Self::normalize(Self::cross(f, up));
+        // Up vector
         let u = Self::cross(s, f);
 
-        // Column-major matrix for WGSL
+        // WebGPU column-major view matrix
+        // Each inner array is a column: [col0, col1, col2, col3]
         [
-            [s[0], s[1], s[2], 0.0],
-            [u[0], u[1], u[2], 0.0],
-            [-f[0], -f[1], -f[2], 0.0],
-            [-Self::dot(s, eye), -Self::dot(u, eye), Self::dot(f, eye), 1.0],
+            [s[0], s[1], s[2], 0.0],                                    // Right vector (column 0)
+            [u[0], u[1], u[2], 0.0],                                    // Up vector (column 1)
+            [-f[0], -f[1], -f[2], 0.0],                                 // Forward vector negated (column 2)
+            [-Self::dot(s, eye), -Self::dot(u, eye), Self::dot(f, eye), 1.0],  // Translation (column 3)
         ]
     }
 
-    /// Perspective projection matrix for WebGPU/Metal (0 to 1 depth range, column-major)
+    /// Perspective projection matrix for WebGPU (0 to 1 depth range, column-major)
     fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
         let f = 1.0 / (fov_y / 2.0).tan();
+
         // WebGPU uses 0 to 1 depth range (not -1 to 1 like OpenGL)
-        // Column-major matrix for WGSL
+        // Column-major format: matrix[column][row]
+        // Standard perspective formula for 0-to-1 depth (Vulkan/WebGPU/Metal style)
+        let a = far / (near - far);
+        let b = (far * near) / (near - far);
+
         [
-            [f / aspect, 0.0, 0.0, 0.0],
-            [0.0, f, 0.0, 0.0],
-            [0.0, 0.0, far / (near - far), (near * far) / (near - far)],
-            [0.0, 0.0, -1.0, 0.0],
+            [f / aspect, 0.0, 0.0, 0.0],     // Column 0: X scaling
+            [0.0, f, 0.0, 0.0],              // Column 1: Y scaling
+            [0.0, 0.0, a, -1.0],             // Column 2: Z transformation + perspective divide trigger
+            [0.0, 0.0, b, 0.0],              // Column 3: Z translation
         ]
     }
 
@@ -558,16 +578,30 @@ impl Renderer {
         a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     }
 
-    fn multiply_matrices(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    /// Multiply two column-major matrices (for WebGPU format)
+    /// In column-major: matrix[col][row], so a[i] is column i
+    fn multiply_matrices_column_major(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
         let mut result = [[0.0; 4]; 4];
-        for i in 0..4 {
-            for j in 0..4 {
+        // For each output column
+        for col in 0..4 {
+            // For each output row
+            for row in 0..4 {
+                // Dot product of row from A with column from B
                 for k in 0..4 {
-                    result[i][j] += a[i][k] * b[k][j];
+                    result[col][row] += a[k][row] * b[col][k];
                 }
             }
         }
         result
+    }
+
+    fn transpose(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+        [
+            [m[0][0], m[1][0], m[2][0], m[3][0]],
+            [m[0][1], m[1][1], m[2][1], m[3][1]],
+            [m[0][2], m[1][2], m[2][2], m[3][2]],
+            [m[0][3], m[1][3], m[2][3], m[3][3]],
+        ]
     }
 
     /// Render to the specified viewport
@@ -649,4 +683,226 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     light_strength: f32,
     camera_pos: [f32; 3], // Camera position (x, y, z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPSILON: f32 = 0.0001;
+
+    fn assert_vec3_near(a: [f32; 3], b: [f32; 3], epsilon: f32) {
+        assert!(
+            (a[0] - b[0]).abs() < epsilon &&
+            (a[1] - b[1]).abs() < epsilon &&
+            (a[2] - b[2]).abs() < epsilon,
+            "Vectors not equal: [{}, {}, {}] vs [{}, {}, {}]",
+            a[0], a[1], a[2], b[0], b[1], b[2]
+        );
+    }
+
+    fn assert_matrix_near(a: [[f32; 4]; 4], b: [[f32; 4]; 4], epsilon: f32) {
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (a[i][j] - b[i][j]).abs() < epsilon,
+                    "Matrix element [{},{}] not equal: {} vs {} (diff: {})",
+                    i, j, a[i][j], b[i][j], (a[i][j] - b[i][j]).abs()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize() {
+        let v = [3.0, 4.0, 0.0];
+        let normalized = Renderer::normalize(v);
+        assert_vec3_near(normalized, [0.6, 0.8, 0.0], EPSILON);
+
+        // Check magnitude is 1
+        let mag = (normalized[0] * normalized[0] + normalized[1] * normalized[1] + normalized[2] * normalized[2]).sqrt();
+        assert!((mag - 1.0).abs() < EPSILON, "Normalized vector magnitude is {}", mag);
+    }
+
+    #[test]
+    fn test_cross_product() {
+        // Test with standard basis vectors
+        let x = [1.0, 0.0, 0.0];
+        let y = [0.0, 1.0, 0.0];
+        let z = Renderer::cross(x, y);
+        assert_vec3_near(z, [0.0, 0.0, 1.0], EPSILON);
+
+        // Test reverse gives negative
+        let neg_z = Renderer::cross(y, x);
+        assert_vec3_near(neg_z, [0.0, 0.0, -1.0], EPSILON);
+    }
+
+    #[test]
+    fn test_dot_product() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0, 6.0];
+        let result = Renderer::dot(a, b);
+        assert!((result - 32.0).abs() < EPSILON, "Dot product is {}", result);
+    }
+
+    #[test]
+    fn test_identity_matrix_multiplication() {
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let test_matrix = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ];
+
+        let result = Renderer::multiply_matrices(identity, test_matrix);
+        assert_matrix_near(result, test_matrix, EPSILON);
+    }
+
+    #[test]
+    fn test_look_at_basic() {
+        // Camera at origin looking down negative Z (standard)
+        let eye = [0.0, 0.0, 0.0];
+        let target = [0.0, 0.0, -1.0];
+        let up = [0.0, 1.0, 0.0];
+
+        let view = Renderer::look_at(eye, target, up);
+
+        // The view matrix should transform world coordinates to camera space
+        // A point at (0, 0, -1) in world space should map to (0, 0, 1) in camera space
+        // (camera looks down -Z, so objects in front are at +Z in view space)
+
+        // Print the matrix for debugging
+        println!("Look-at matrix (eye at origin, looking at -Z):");
+        for row in &view {
+            println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+        }
+
+        // At minimum, the matrix should be valid (not NaN)
+        for row in &view {
+            for &val in row {
+                assert!(!val.is_nan(), "View matrix contains NaN");
+            }
+        }
+    }
+
+    #[test]
+    fn test_look_at_camera_offset() {
+        // Camera at (5, 0, 0) looking at origin
+        let eye = [5.0, 0.0, 0.0];
+        let target = [0.0, 0.0, 0.0];
+        let up = [0.0, 1.0, 0.0];
+
+        let view = Renderer::look_at(eye, target, up);
+
+        println!("Look-at matrix (eye at (5,0,0), looking at origin):");
+        for row in &view {
+            println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+        }
+
+        // Check no NaN values
+        for row in &view {
+            for &val in row {
+                assert!(!val.is_nan(), "View matrix contains NaN");
+            }
+        }
+    }
+
+    #[test]
+    fn test_perspective_basic() {
+        let fov_y = 45.0_f32.to_radians();
+        let aspect = 16.0 / 9.0;
+        let near = 0.1;
+        let far = 100.0;
+
+        let proj = Renderer::perspective(fov_y, aspect, near, far);
+
+        println!("Perspective matrix (45° FOV, 16:9 aspect):");
+        for row in &proj {
+            println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+        }
+
+        // Check no NaN values
+        for row in &proj {
+            for &val in row {
+                assert!(!val.is_nan(), "Projection matrix contains NaN");
+            }
+        }
+
+        // Check that [3][2] is -1 (this is the w component divider for perspective)
+        assert!((proj[3][2] - (-1.0)).abs() < EPSILON, "proj[3][2] should be -1.0, got {}", proj[3][2]);
+    }
+
+    #[test]
+    fn test_view_projection_combination() {
+        // Set up a simple camera
+        let eye = [0.0, 0.0, 5.0];  // Camera back 5 units on Z
+        let target = [0.0, 0.0, 0.0];  // Looking at origin
+        let up = [0.0, 1.0, 0.0];
+
+        let view = Renderer::look_at(eye, target, up);
+
+        let fov_y = 45.0_f32.to_radians();
+        let aspect = 1.0;  // Square viewport
+        let near = 0.1;
+        let far = 100.0;
+
+        let proj = Renderer::perspective(fov_y, aspect, near, far);
+
+        let view_proj = Renderer::multiply_matrices(proj, view);
+
+        println!("View-Projection matrix:");
+        for row in &view_proj {
+            println!("  [{:8.4}, {:8.4}, {:8.4}, {:8.4}]", row[0], row[1], row[2], row[3]);
+        }
+
+        // Check no NaN values
+        for row in &view_proj {
+            for &val in row {
+                assert!(!val.is_nan(), "View-Projection matrix contains NaN");
+            }
+        }
+    }
+
+    #[test]
+    fn test_spherical_to_cartesian() {
+        // Test that spherical coordinates convert correctly to cartesian
+        let distance: f32 = 5.0;
+        let azimuth: f32 = 0.0;  // Looking from +X axis
+        let elevation: f32 = 0.0;  // On the XZ plane
+
+        let horizontal_distance = distance * elevation.cos();
+        let x = horizontal_distance * azimuth.cos();
+        let y = distance * elevation.sin();
+        let z = horizontal_distance * azimuth.sin();
+
+        assert_vec3_near([x, y, z], [5.0, 0.0, 0.0], EPSILON);
+
+        // Test azimuth = 90° (π/2)
+        let azimuth = std::f32::consts::PI / 2.0;
+        let horizontal_distance = distance * elevation.cos();
+        let x = horizontal_distance * azimuth.cos();
+        let y = distance * elevation.sin();
+        let z = horizontal_distance * azimuth.sin();
+
+        assert_vec3_near([x, y, z], [0.0, 0.0, 5.0], EPSILON);
+
+        // Test elevation = 45°
+        let azimuth: f32 = 0.0;
+        let elevation: f32 = std::f32::consts::PI / 4.0;
+        let horizontal_distance = distance * elevation.cos();
+        let x = horizontal_distance * azimuth.cos();
+        let y = distance * elevation.sin();
+        let z = horizontal_distance * azimuth.sin();
+
+        let expected_h = 5.0 * (std::f32::consts::PI / 4.0).cos();
+        let expected_y = 5.0 * (std::f32::consts::PI / 4.0).sin();
+        assert_vec3_near([x, y, z], [expected_h, expected_y, 0.0], EPSILON);
+    }
 }

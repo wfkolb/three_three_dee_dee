@@ -28,49 +28,16 @@ fn vs_main(
     model: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
+
+    // Store world position for lighting calculations
     out.world_position = model.position;
 
-    // Get rotation angles and distance from uniforms
-    let azimuth = uniforms.view_proj[0][3]; // Horizontal rotation (yaw)
-    let elevation = uniforms.view_proj[1][3]; // Vertical rotation (pitch)
-    let camera_distance = uniforms.view_proj[2][3]; // Camera distance for zoom
+    // Transform normal to world space (for now, just use as-is since we have no model matrix)
+    out.world_normal = normalize(model.normal);
 
-    // First, rotate around Y axis (azimuth/yaw)
-    let cos_az = cos(azimuth);
-    let sin_az = sin(azimuth);
-    let rotated_x = model.position.x * cos_az - model.position.z * sin_az;
-    let rotated_z = model.position.x * sin_az + model.position.z * cos_az;
-    var pos = vec3<f32>(rotated_x, model.position.y, rotated_z);
-
-    // Then, rotate around X axis (elevation/pitch)
-    let cos_el = cos(elevation);
-    let sin_el = sin(elevation);
-    let final_y = pos.y * cos_el - pos.z * sin_el;
-    let final_z = pos.y * sin_el + pos.z * cos_el;
-    pos = vec3<f32>(pos.x, final_y, final_z);
-
-    // Rotate the normal with the same transformations
-    // First azimuth rotation
-    let norm_x1 = model.normal.x * cos_az - model.normal.z * sin_az;
-    let norm_z1 = model.normal.x * sin_az + model.normal.z * cos_az;
-    var normal = vec3<f32>(norm_x1, model.normal.y, norm_z1);
-
-    // Then elevation rotation
-    let norm_y2 = normal.y * cos_el - normal.z * sin_el;
-    let norm_z2 = normal.y * sin_el + normal.z * cos_el;
-    normal = vec3<f32>(normal.x, norm_y2, norm_z2);
-
-    out.world_normal = normalize(normal);
-
-    // Scale based on camera distance for zoom effect
-    // Base scale of 0.3, inversely proportional to distance
-    // Reference distance is 5.0 (initial distance for the cube)
-    let base_distance = 5.0;
-    let scale = 0.3 * (base_distance / camera_distance);
-    pos = pos * scale;
-
-    // Push back slightly in Z
-    out.clip_position = vec4<f32>(pos.x, pos.y, pos.z * 0.5 + 0.5, 1.0);
+    // Transform vertex position using view-projection matrix
+    let world_pos = vec4<f32>(model.position, 1.0);
+    out.clip_position = uniforms.view_proj * world_pos;
 
     return out;
 }
