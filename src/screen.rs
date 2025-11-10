@@ -2,11 +2,21 @@ use crate::fbx_loader::FbxLoader;
 use crate::reference_mesh::{ReferenceMesh, Vertex};
 use crate::renderer::{Camera, Renderer, Viewport};
 
+/// Camera state at a specific time for shared history
+#[derive(Clone)]
+pub struct CameraState {
+    pub timestamp: f32,
+    pub angle: f32,
+    pub pitch: f32,
+}
+
 /// Screen manages multiple renderers and coordinates rendering
 pub struct Screen {
     renderers: Vec<Renderer>,
     model_center: [f32; 3],
     camera_distance: f32,
+    camera_history: std::collections::VecDeque<CameraState>,
+    max_history_seconds: f32,
 }
 
 /// Mesh source that can be either FBX or reference mesh
@@ -21,6 +31,8 @@ impl Screen {
             renderers: Vec::new(),
             model_center: [0.0, 0.0, 0.0],
             camera_distance: 5.0,
+            camera_history: std::collections::VecDeque::new(),
+            max_history_seconds: 15.0,
         }
     }
 
@@ -195,9 +207,32 @@ impl Screen {
         queue: &wgpu::Queue,
         elapsed_time: f32,
     ) {
-        // Update all cameras
-        for renderer in &mut self.renderers {
-            renderer.update_camera(queue);
+        // Get current camera state from first renderer (master)
+        if let Some(first_renderer) = self.renderers.first_mut() {
+            // Update the master renderer (no time offset)
+            first_renderer.update_camera(queue, elapsed_time);
+
+            // Record current state to history
+            let current_state = CameraState {
+                timestamp: elapsed_time,
+                angle: first_renderer.get_current_angle(),
+                pitch: first_renderer.get_current_pitch(),
+            };
+            self.camera_history.push_back(current_state);
+
+            // Remove old history beyond max_history_seconds
+            while let Some(oldest) = self.camera_history.front() {
+                if elapsed_time - oldest.timestamp > self.max_history_seconds {
+                    self.camera_history.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Update remaining renderers with time-delayed playback
+        for renderer in self.renderers.iter_mut().skip(1) {
+            renderer.update_camera_from_history(queue, elapsed_time, &self.camera_history);
         }
 
         // Render all viewports
