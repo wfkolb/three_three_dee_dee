@@ -397,7 +397,7 @@ impl ApplicationHandler for App {
                         // Add viewport (+ key)
                         // Generate random time offset if Shift is held (0-2 seconds)
                         let time_offset = if state.modifiers.shift_key() {
-                            rand::thread_rng().gen_range(0.0..=2.0)
+                            rand::thread_rng().gen_range(1.0..=10.0)
                         } else {
                             0.0
                         };

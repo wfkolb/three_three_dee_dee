@@ -74,6 +74,10 @@ pub struct Renderer {
     pub camera_distance: f32,
     rotation_speed: f32,
     current_angle: f32,
+    manual_angle_offset: f32, // Offset from manual camera rotation
+    target_manual_angle: f32, // Target angle for smooth interpolation
+    manual_pitch_offset: f32, // Manual pitch changes
+    target_manual_pitch: f32, // Target pitch for smooth interpolation
     light_strength: f32,
 
     // GPU resources
@@ -104,6 +108,10 @@ impl Renderer {
             camera_distance,
             rotation_speed: 0.00, // radians per frame (slower, smoother rotation)
             current_angle: std::f32::consts::PI / 2.0, // Start at 90° to match initial +Z position
+            manual_angle_offset: 0.0, // No manual offset initially
+            target_manual_angle: 0.0,
+            manual_pitch_offset: 0.0,
+            target_manual_pitch: 0.0,
             light_strength: 0.7,
             vertex_buffer: None,
             index_buffer: None,
@@ -119,14 +127,114 @@ impl Renderer {
         }
     }
 
-    /// Update camera position for rotation
-    pub fn update_camera(&mut self, queue: &wgpu::Queue) {
-        self.current_angle += self.rotation_speed;
+    /// Get current angle for history recording
+    pub fn get_current_angle(&self) -> f32 {
+        self.target_manual_angle
+    }
+
+    /// Get current pitch for history recording
+    pub fn get_current_pitch(&self) -> f32 {
+        self.target_manual_pitch
+    }
+
+    /// Update camera from history buffer (for time-delayed playback)
+    pub fn update_camera_from_history(
+        &mut self,
+        queue: &wgpu::Queue,
+        elapsed_time: f32,
+        history: &std::collections::VecDeque<crate::screen::CameraState>,
+    ) {
+        // Calculate the target time to look up in history
+        let target_time = elapsed_time - self.time_offset;
+
+        // Find the camera state at target_time from history
+        let (angle, pitch) = if let Some(state) = Self::find_state_at_time(history, target_time) {
+            (state.angle, state.pitch)
+        } else {
+            // No history yet, use initial state
+            (0.0, 0.0)
+        };
+
+        // Apply the historical state
+        self.current_angle = std::f32::consts::PI / 2.0 + angle;
+        let effective_pitch = self.camera.pitch + pitch;
+
+        // Calculate camera position using spherical coordinates
+        let horizontal_distance = self.camera_distance * effective_pitch.cos();
+        let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
+        let y = self.model_center[1] + self.camera_distance * effective_pitch.sin();
+        let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
+
+        self.camera.position = [x, y, z];
+        self.camera.direction = [
+            self.model_center[0] - x,
+            self.model_center[1] - y,
+            self.model_center[2] - z,
+        ];
+
+        self.camera.yaw = self.current_angle;
+        self.camera.roll = 0.0;
+
+        // Update uniforms
+        let uniforms = self.create_uniforms();
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+    }
+
+    /// Find camera state at a specific time using linear interpolation
+    fn find_state_at_time(
+        history: &std::collections::VecDeque<crate::screen::CameraState>,
+        target_time: f32,
+    ) -> Option<crate::screen::CameraState> {
+        if history.is_empty() {
+            return None;
+        }
+
+        // If target time is before first entry, return first entry
+        if target_time <= history.front().unwrap().timestamp {
+            return Some(history.front().unwrap().clone());
+        }
+
+        // If target time is after last entry, return last entry
+        if target_time >= history.back().unwrap().timestamp {
+            return Some(history.back().unwrap().clone());
+        }
+
+        // Find the two states to interpolate between
+        for i in 0..history.len() - 1 {
+            let state1 = &history[i];
+            let state2 = &history[i + 1];
+
+            if target_time >= state1.timestamp && target_time <= state2.timestamp {
+                // Linear interpolation
+                let t = (target_time - state1.timestamp) / (state2.timestamp - state1.timestamp);
+                return Some(crate::screen::CameraState {
+                    timestamp: target_time,
+                    angle: state1.angle + (state2.angle - state1.angle) * t,
+                    pitch: state1.pitch + (state2.pitch - state1.pitch) * t,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Update camera position for rotation (master renderer only)
+    pub fn update_camera(&mut self, queue: &wgpu::Queue, _elapsed_time: f32) {
+        // Apply manual inputs directly (no interpolation for master)
+        self.target_manual_angle += 0.0; // This will be updated by adjust_camera_rotation
+
+        // Use the target values directly
+        self.current_angle = std::f32::consts::PI / 2.0 + self.target_manual_angle;
+        let effective_pitch = self.camera.pitch + self.target_manual_pitch;
 
         // Calculate camera position using spherical coordinates (supports both auto and manual rotation)
-        let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
+        let horizontal_distance = self.camera_distance * effective_pitch.cos();
         let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
-        let y = self.model_center[1] + self.camera_distance * self.camera.pitch.sin();
+        let y = self.model_center[1] + self.camera_distance * effective_pitch.sin();
         let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
 
         self.camera.position = [x, y, z];
@@ -161,38 +269,17 @@ impl Renderer {
     }
 
     /// Adjust camera rotation manually (azimuth and elevation)
-    pub fn adjust_camera_rotation(&mut self, azimuth_delta: f32, elevation_delta: f32, queue: &wgpu::Queue) {
-        // Update angles
-        self.current_angle += azimuth_delta;
-        self.camera.pitch += elevation_delta;
+    pub fn adjust_camera_rotation(&mut self, azimuth_delta: f32, elevation_delta: f32, _queue: &wgpu::Queue) {
+        // Update target angles for smooth interpolation
+        // This creates the delayed/lagging effect for manual controls
+        self.target_manual_angle += azimuth_delta;
+        self.target_manual_pitch += elevation_delta;
 
-        // Clamp pitch to prevent flipping (keep between -89 and 89 degrees)
-        self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
+        // Clamp target pitch to prevent flipping (keep between -89 and 89 degrees)
+        self.target_manual_pitch = self.target_manual_pitch.clamp(-1.55, 1.55);
 
-        // Calculate camera position using spherical coordinates
-        let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
-        let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
-        let y = self.model_center[1] + self.camera_distance * self.camera.pitch.sin();
-        let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
-
-        self.camera.position = [x, y, z];
-        self.camera.direction = [
-            self.model_center[0] - x,
-            self.model_center[1] - y,
-            self.model_center[2] - z,
-        ];
-
-        // Update camera orientation
-        self.camera.yaw = self.current_angle;
-        self.camera.roll = 0.0;
-
-        // Update uniforms with new camera position
-        let uniforms = self.create_uniforms();
-        queue.write_buffer(
-            self.uniform_buffer.as_ref().unwrap(),
-            0,
-            bytemuck::cast_slice(&[uniforms]),
-        );
+        // Note: Actual camera update happens in update_camera() through interpolation
+        // This allows the time offset to create a natural lag effect
     }
 
     /// Adjust camera distance (zoom in/out)
