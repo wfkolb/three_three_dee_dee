@@ -17,6 +17,9 @@ pub struct Camera {
     pub direction: [f32; 3],
     pub near_plane: f32,
     pub far_plane: f32,
+    pub yaw: f32,    // Rotation around Y axis (radians)
+    pub pitch: f32,  // Rotation around X axis (radians)
+    pub roll: f32,   // Rotation around Z axis (radians)
 }
 
 impl Camera {
@@ -26,6 +29,9 @@ impl Camera {
             direction,
             near_plane: near,
             far_plane: far,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
         }
     }
 }
@@ -35,6 +41,7 @@ impl Camera {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuVertex {
     position: [f32; 3],
+    normal: [f32; 3],
 }
 
 impl GpuVertex {
@@ -42,11 +49,18 @@ impl GpuVertex {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x3,
-            }],
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
         }
     }
 }
@@ -57,15 +71,19 @@ pub struct Renderer {
     pub viewport: Viewport,
     pub frame_offset: u32,
     model_center: [f32; 3],
-    camera_distance: f32,
+    pub camera_distance: f32,
     rotation_speed: f32,
     current_angle: f32,
+    light_strength: f32,
 
     // GPU resources
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     num_indices: u32,
+    edge_index_buffer: Option<wgpu::Buffer>,
+    num_edge_indices: u32,
     render_pipeline: Option<wgpu::RenderPipeline>,
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
     uniform_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
 }
@@ -78,12 +96,16 @@ impl Renderer {
             frame_offset,
             model_center,
             camera_distance,
-            rotation_speed: 0.01, // radians per frame (slower, smoother rotation)
+            rotation_speed: 0.00, // radians per frame (slower, smoother rotation)
             current_angle: 0.0,
+            light_strength: 0.7,
             vertex_buffer: None,
             index_buffer: None,
             num_indices: 0,
+            edge_index_buffer: None,
+            num_edge_indices: 0,
             render_pipeline: None,
+            wireframe_pipeline: None,
             uniform_buffer: None,
             bind_group: None,
         }
@@ -93,18 +115,97 @@ impl Renderer {
     pub fn update_camera(&mut self, queue: &wgpu::Queue) {
         self.current_angle += self.rotation_speed;
 
-        // Orbit camera around model center
-        let x = self.model_center[0] + self.camera_distance * self.current_angle.cos();
-        let z = self.model_center[2] + self.camera_distance * self.current_angle.sin();
+        // Calculate camera position using spherical coordinates (supports both auto and manual rotation)
+        let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
+        let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
+        let y = self.model_center[1] + self.camera_distance * self.camera.pitch.sin();
+        let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
 
-        self.camera.position = [x, self.model_center[1], z];
+        self.camera.position = [x, y, z];
         self.camera.direction = [
             self.model_center[0] - x,
-            self.model_center[1] - self.camera.position[1],
+            self.model_center[1] - y,
             self.model_center[2] - z,
         ];
 
+        // Update camera orientation
+        self.camera.yaw = self.current_angle;
+        self.camera.roll = 0.0;
+
         // Update uniforms with new camera position
+        let uniforms = self.create_uniforms();
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+    }
+
+    /// Adjust light strength (clamped between 0.0 and 2.0)
+    pub fn adjust_light(&mut self, delta: f32, queue: &wgpu::Queue) {
+        self.light_strength = (self.light_strength + delta).clamp(0.0, 2.0);
+        let uniforms = self.create_uniforms();
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+    }
+
+    /// Adjust camera rotation manually (azimuth and elevation)
+    pub fn adjust_camera_rotation(&mut self, azimuth_delta: f32, elevation_delta: f32, queue: &wgpu::Queue) {
+        // Update angles
+        self.current_angle += azimuth_delta;
+        self.camera.pitch += elevation_delta;
+
+        // Clamp pitch to prevent flipping (keep between -89 and 89 degrees)
+        self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
+
+        // Calculate camera position using spherical coordinates
+        let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
+        let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
+        let y = self.model_center[1] + self.camera_distance * self.camera.pitch.sin();
+        let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
+
+        self.camera.position = [x, y, z];
+        self.camera.direction = [
+            self.model_center[0] - x,
+            self.model_center[1] - y,
+            self.model_center[2] - z,
+        ];
+
+        // Update camera orientation
+        self.camera.yaw = self.current_angle;
+        self.camera.roll = 0.0;
+
+        // Update uniforms with new camera position
+        let uniforms = self.create_uniforms();
+        queue.write_buffer(
+            self.uniform_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+    }
+
+    /// Adjust camera distance (zoom in/out)
+    pub fn adjust_camera_distance(&mut self, distance_delta: f32, queue: &wgpu::Queue) {
+        // Adjust distance with min/max constraints
+        self.camera_distance = (self.camera_distance + distance_delta).clamp(0.5, 50.0);
+
+        // Recalculate camera position with new distance
+        let horizontal_distance = self.camera_distance * self.camera.pitch.cos();
+        let x = self.model_center[0] + horizontal_distance * self.current_angle.cos();
+        let y = self.model_center[1] + self.camera_distance * self.camera.pitch.sin();
+        let z = self.model_center[2] + horizontal_distance * self.current_angle.sin();
+
+        self.camera.position = [x, y, z];
+        self.camera.direction = [
+            self.model_center[0] - x,
+            self.model_center[1] - y,
+            self.model_center[2] - z,
+        ];
+
+        // Update uniforms
         let uniforms = self.create_uniforms();
         queue.write_buffer(
             self.uniform_buffer.as_ref().unwrap(),
@@ -128,6 +229,7 @@ impl Renderer {
             .iter()
             .map(|v| GpuVertex {
                 position: [v.x, v.y, v.z],
+                normal: [v.nx, v.ny, v.nz],
             })
             .collect();
 
@@ -150,7 +252,19 @@ impl Renderer {
         );
         self.num_indices = indices.len() as u32;
 
-        println!("    Renderer: Created buffers with {} indices", self.num_indices);
+        // Create edge indices for wireframe (draw edges as lines)
+        // For a cube with 24 vertices (4 per face), we need to extract unique edges
+        let edge_indices = Self::generate_edge_indices(indices);
+        self.edge_index_buffer = Some(
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Edge Index Buffer"),
+                contents: bytemuck::cast_slice(&edge_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        );
+        self.num_edge_indices = edge_indices.len() as u32;
+
+        println!("    Renderer: Created buffers with {} indices, {} edge indices", self.num_indices, self.num_edge_indices);
 
         // Create uniform buffer for camera matrices
         let uniforms = self.create_uniforms();
@@ -166,7 +280,7 @@ impl Renderer {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -240,6 +354,47 @@ impl Renderer {
                 cache: None,
             }),
         );
+
+        // Create wireframe pipeline for drawing edges
+        self.wireframe_pipeline = Some(
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Wireframe Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[GpuVertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_wireframe"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            }),
+        );
     }
 
     /// Create uniform data for camera matrices
@@ -262,9 +417,13 @@ impl Renderer {
 
         let mut view_proj = Self::multiply_matrices(projection, view);
 
-        // Store the rotation angle in an unused part of the matrix
-        // Use first row, last column to pass the angle to the shader
+        // Store rotation angles and distance in unused parts of the matrix
+        // Use first row, last column for azimuth (yaw)
+        // Use second row, last column for elevation (pitch)
+        // Use third row, last column for camera distance
         view_proj[0][3] = self.current_angle;
+        view_proj[1][3] = self.camera.pitch;
+        view_proj[2][3] = self.camera_distance;
 
         // Debug output on first frame
         static FIRST_CALL: std::sync::Once = std::sync::Once::new();
@@ -282,6 +441,8 @@ impl Renderer {
 
         Uniforms {
             view_proj,
+            light_strength: self.light_strength,
+            camera_pos: self.camera.position,
         }
     }
 
@@ -315,6 +476,28 @@ impl Renderer {
             [0.0, 0.0, far / (near - far), (near * far) / (near - far)],
             [0.0, 0.0, -1.0, 0.0],
         ]
+    }
+
+    /// Generate edge indices from triangle indices for wireframe rendering
+    fn generate_edge_indices(indices: &[u32]) -> Vec<u32> {
+        let mut edge_indices = Vec::new();
+
+        // For each triangle, add its three edges
+        for chunk in indices.chunks(3) {
+            if chunk.len() == 3 {
+                // Add three edges of the triangle (as line pairs)
+                edge_indices.push(chunk[0]);
+                edge_indices.push(chunk[1]);
+
+                edge_indices.push(chunk[1]);
+                edge_indices.push(chunk[2]);
+
+                edge_indices.push(chunk[2]);
+                edge_indices.push(chunk[0]);
+            }
+        }
+
+        edge_indices
     }
 
     // Helper math functions
@@ -396,6 +579,7 @@ impl Renderer {
             1.0,
         );
 
+        // Draw solid mesh
         render_pass.set_pipeline(self.render_pipeline.as_ref().unwrap());
         render_pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.as_ref().unwrap().slice(..));
@@ -404,6 +588,15 @@ impl Renderer {
             wgpu::IndexFormat::Uint32,
         );
         render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+
+        // Draw wireframe edges on top
+        render_pass.set_pipeline(self.wireframe_pipeline.as_ref().unwrap());
+        // Bind group and vertex buffer are already set
+        render_pass.set_index_buffer(
+            self.edge_index_buffer.as_ref().unwrap().slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        render_pass.draw_indexed(0..self.num_edge_indices, 0, 0..1);
     }
 }
 
@@ -412,4 +605,6 @@ impl Renderer {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    light_strength: f32,
+    camera_pos: [f32; 3], // Camera position (x, y, z)
 }

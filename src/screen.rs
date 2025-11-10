@@ -140,4 +140,37 @@ impl Screen {
     pub fn renderer_count(&self) -> usize {
         self.renderers.len()
     }
+
+    /// Adjust light strength for all renderers
+    pub fn adjust_light(&mut self, delta: f32, queue: &wgpu::Queue) {
+        for renderer in &mut self.renderers {
+            renderer.adjust_light(delta, queue);
+        }
+    }
+
+    /// Get camera orientation from the first renderer (if any)
+    pub fn get_camera_orientation(&self) -> Option<(f32, f32, f32)> {
+        self.renderers.first().map(|r| {
+            (r.camera.yaw, r.camera.pitch, r.camera.roll)
+        })
+    }
+
+    /// Get camera distance from the first renderer (if any)
+    pub fn get_camera_distance(&self) -> Option<f32> {
+        self.renderers.first().map(|r| r.camera_distance)
+    }
+
+    /// Adjust camera rotation by delta angles
+    pub fn adjust_camera_rotation(&mut self, azimuth_delta: f32, elevation_delta: f32, queue: &wgpu::Queue) {
+        for renderer in &mut self.renderers {
+            renderer.adjust_camera_rotation(azimuth_delta, elevation_delta, queue);
+        }
+    }
+
+    /// Adjust camera distance (zoom)
+    pub fn adjust_camera_distance(&mut self, distance_delta: f32, queue: &wgpu::Queue) {
+        for renderer in &mut self.renderers {
+            renderer.adjust_camera_distance(distance_delta, queue);
+        }
+    }
 }

@@ -5,11 +5,18 @@ pub struct Vertex {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+    pub nx: f32,
+    pub ny: f32,
+    pub nz: f32,
 }
 
 impl Vertex {
     pub fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
+        Self { x, y, z, nx: 0.0, ny: 0.0, nz: 0.0 }
+    }
+
+    pub fn with_normal(x: f32, y: f32, z: f32, nx: f32, ny: f32, nz: f32) -> Self {
+        Self { x, y, z, nx, ny, nz }
     }
 }
 
@@ -20,19 +27,46 @@ pub struct ReferenceMesh {
 
 impl ReferenceMesh {
     /// Create a simple cube mesh centered at origin with size 2.0 (from -1.0 to 1.0)
+    /// Each face has its own vertices with proper normals
     pub fn cube() -> Self {
-        // Define 8 vertices of a cube
+        // Create vertices with proper normals for each face
+        // We need 24 vertices (4 per face, 6 faces) to have correct per-face normals
         let vertices = vec![
-            // Front face
-            Vertex::new(-1.0, -1.0, 1.0),  // 0
-            Vertex::new(1.0, -1.0, 1.0),   // 1
-            Vertex::new(1.0, 1.0, 1.0),    // 2
-            Vertex::new(-1.0, 1.0, 1.0),   // 3
-            // Back face
-            Vertex::new(-1.0, -1.0, -1.0), // 4
-            Vertex::new(1.0, -1.0, -1.0),  // 5
-            Vertex::new(1.0, 1.0, -1.0),   // 6
-            Vertex::new(-1.0, 1.0, -1.0),  // 7
+            // Front face (normal: 0, 0, 1)
+            Vertex::with_normal(-1.0, -1.0, 1.0, 0.0, 0.0, 1.0),  // 0
+            Vertex::with_normal(1.0, -1.0, 1.0, 0.0, 0.0, 1.0),   // 1
+            Vertex::with_normal(1.0, 1.0, 1.0, 0.0, 0.0, 1.0),    // 2
+            Vertex::with_normal(-1.0, 1.0, 1.0, 0.0, 0.0, 1.0),   // 3
+
+            // Back face (normal: 0, 0, -1)
+            Vertex::with_normal(1.0, -1.0, -1.0, 0.0, 0.0, -1.0), // 4
+            Vertex::with_normal(-1.0, -1.0, -1.0, 0.0, 0.0, -1.0),// 5
+            Vertex::with_normal(-1.0, 1.0, -1.0, 0.0, 0.0, -1.0), // 6
+            Vertex::with_normal(1.0, 1.0, -1.0, 0.0, 0.0, -1.0),  // 7
+
+            // Top face (normal: 0, 1, 0)
+            Vertex::with_normal(-1.0, 1.0, 1.0, 0.0, 1.0, 0.0),   // 8
+            Vertex::with_normal(1.0, 1.0, 1.0, 0.0, 1.0, 0.0),    // 9
+            Vertex::with_normal(1.0, 1.0, -1.0, 0.0, 1.0, 0.0),   // 10
+            Vertex::with_normal(-1.0, 1.0, -1.0, 0.0, 1.0, 0.0),  // 11
+
+            // Bottom face (normal: 0, -1, 0)
+            Vertex::with_normal(-1.0, -1.0, -1.0, 0.0, -1.0, 0.0),// 12
+            Vertex::with_normal(1.0, -1.0, -1.0, 0.0, -1.0, 0.0), // 13
+            Vertex::with_normal(1.0, -1.0, 1.0, 0.0, -1.0, 0.0),  // 14
+            Vertex::with_normal(-1.0, -1.0, 1.0, 0.0, -1.0, 0.0), // 15
+
+            // Right face (normal: 1, 0, 0)
+            Vertex::with_normal(1.0, -1.0, 1.0, 1.0, 0.0, 0.0),   // 16
+            Vertex::with_normal(1.0, -1.0, -1.0, 1.0, 0.0, 0.0),  // 17
+            Vertex::with_normal(1.0, 1.0, -1.0, 1.0, 0.0, 0.0),   // 18
+            Vertex::with_normal(1.0, 1.0, 1.0, 1.0, 0.0, 0.0),    // 19
+
+            // Left face (normal: -1, 0, 0)
+            Vertex::with_normal(-1.0, -1.0, -1.0, -1.0, 0.0, 0.0),// 20
+            Vertex::with_normal(-1.0, -1.0, 1.0, -1.0, 0.0, 0.0), // 21
+            Vertex::with_normal(-1.0, 1.0, 1.0, -1.0, 0.0, 0.0),  // 22
+            Vertex::with_normal(-1.0, 1.0, -1.0, -1.0, 0.0, 0.0), // 23
         ];
 
         // Define indices for 12 triangles (2 per face, 6 faces)
@@ -41,15 +75,15 @@ impl ReferenceMesh {
             // Front face
             0, 1, 2,  0, 2, 3,
             // Back face
-            5, 4, 7,  5, 7, 6,
+            4, 5, 6,  4, 6, 7,
             // Top face
-            3, 2, 6,  3, 6, 7,
+            8, 9, 10,  8, 10, 11,
             // Bottom face
-            4, 5, 1,  4, 1, 0,
+            12, 13, 14,  12, 14, 15,
             // Right face
-            1, 5, 6,  1, 6, 2,
+            16, 17, 18,  16, 18, 19,
             // Left face
-            4, 0, 3,  4, 3, 7,
+            20, 21, 22,  20, 22, 23,
         ];
 
         Self { vertices, indices }

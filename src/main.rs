@@ -30,6 +30,9 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     window: std::sync::Arc<winit::window::Window>,
     screen: Screen,
+    text_brush: wgpu_text::TextBrush<wgpu_text::glyph_brush::ab_glyph::FontArc>,
+    mouse_pressed: bool,
+    last_mouse_pos: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 impl State {
@@ -50,7 +53,7 @@ impl State {
         let size = window.inner_size();
 
         // Create wgpu instance
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
@@ -70,15 +73,13 @@ impl State {
 
         // Request device and queue
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .unwrap();
 
@@ -153,6 +154,18 @@ impl State {
         };
         screen.initialize_renderers(&device, &config, mesh_source);
 
+        // Create text brush for rendering orientation info
+        let text_brush = {
+            use wgpu_text::glyph_brush::ab_glyph::FontArc;
+            // Load custom font from resources folder
+            let font_data = std::fs::read("resources/TrenchThin-aZ1J.ttf")
+                .expect("Failed to read font file");
+            let font = FontArc::try_from_vec(font_data)
+                .expect("Failed to load font");
+            wgpu_text::BrushBuilder::using_font(font)
+                .build(&device, size.width, size.height, config.format)
+        };
+
         Self {
             surface,
             device,
@@ -161,6 +174,9 @@ impl State {
             size,
             window,
             screen,
+            text_brush,
+            mouse_pressed: false,
+            last_mouse_pos: None,
         }
     }
 
@@ -210,6 +226,58 @@ impl State {
 
         // Render all viewports via Screen
         self.screen.render(&mut encoder, &view, &self.queue);
+
+        // Draw camera orientation text
+        if let Some((azimuth, elevation, _roll)) = self.screen.get_camera_orientation() {
+            if let Some(depth) = self.screen.get_camera_distance() {
+                use wgpu_text::glyph_brush::{Section, Text};
+
+                // Normalize angles to 0-360 range
+                let normalize_angle = |angle_rad: f32| -> f32 {
+                    let degrees = angle_rad.to_degrees();
+                    ((degrees % 360.0) + 360.0) % 360.0
+                };
+
+                let azimuth_deg = normalize_angle(azimuth);
+                let elevation_deg = normalize_angle(elevation);
+
+                let text = format!(
+                    "Azimuth: {:.1}° Elevation: {:.1}° Depth: {:.2}",
+                    azimuth_deg,
+                    elevation_deg,
+                    depth
+                );
+
+                let _ = self.text_brush.queue(&self.device, &self.queue, vec![
+                    Section {
+                        screen_position: (10.0, 10.0),
+                        bounds: (self.size.width as f32, self.size.height as f32),
+                        text: vec![Text::new(&text)
+                            .with_color([1.0, 1.0, 1.0, 1.0])
+                            .with_scale(20.0)],
+                        ..Section::default()
+                    }
+                ]);
+
+                // Draw text using a render pass
+                let mut text_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Text Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+
+                self.text_brush.draw(&mut text_pass);
+            }
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -263,8 +331,65 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => event_loop.exit(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        physical_key: PhysicalKey::Code(key_code),
+                        ..
+                    },
+                ..
+            } => {
+                match key_code {
+                    KeyCode::ArrowUp => {
+                        state.screen.adjust_light(0.1, &state.queue);
+                    }
+                    KeyCode::ArrowDown => {
+                        state.screen.adjust_light(-0.1, &state.queue);
+                    }
+                    _ => {}
+                }
+            }
             WindowEvent::Resized(physical_size) => {
                 state.resize(physical_size);
+            }
+            WindowEvent::MouseInput { state: button_state, button, .. } => {
+                if button == winit::event::MouseButton::Left {
+                    state.mouse_pressed = button_state == ElementState::Pressed;
+                    if !state.mouse_pressed {
+                        state.last_mouse_pos = None;
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if state.mouse_pressed {
+                    if let Some(last_pos) = state.last_mouse_pos {
+                        let delta_x = position.x - last_pos.x;
+                        let delta_y = position.y - last_pos.y;
+
+                        // Convert pixel movement to angle changes
+                        // Sensitivity: 0.005 radians per pixel
+                        let azimuth_delta = -(delta_x as f32) * 0.005;
+                        let elevation_delta = -(delta_y as f32) * 0.005;
+
+                        state.screen.adjust_camera_rotation(azimuth_delta, elevation_delta, &state.queue);
+                    }
+                    state.last_mouse_pos = Some(position);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Handle mouse wheel for zoom (adjusting camera distance)
+                let zoom_delta = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                        // Line-based scrolling (typical mouse wheel)
+                        y * 0.5 // Adjust sensitivity
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        // Pixel-based scrolling (touchpad)
+                        (pos.y as f32) * 0.01
+                    }
+                };
+                state.screen.adjust_camera_distance(-zoom_delta, &state.queue);
             }
             WindowEvent::RedrawRequested => {
                 match state.render() {
